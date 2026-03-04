@@ -1,9 +1,9 @@
-# Library Promotion Workflow
+# Selective Library Promotion Workflow
 #
-# Semi-automates moving approved changes from a source library
-# to a target library and bumps the target version.
+# Promotes only selected files/folders from source library to target library,
+# then bumps target version and opens a PR.
 
-name: Promote Library Changes
+name: Promote Selected Library Changes
 
 on:
   workflow_dispatch:
@@ -22,12 +22,12 @@ on:
         default: ""
         type: string
       source_dir:
-        description: Source library directory to promote from (example: mod)
+        description: Source library directory (example: mod)
         required: true
         default: mod
         type: string
       target_dir:
-        description: Target library directory to promote into (example: base)
+        description: Target library directory (example: base)
         required: true
         default: base
         type: string
@@ -41,6 +41,11 @@ on:
         required: true
         default: main
         type: string
+      include_paths:
+        description: Newline-separated paths under source_dir to promote (files or folders)
+        required: true
+        default: |
+          programs/
       version_bump:
         description: Version bump type (patch/minor/major)
         required: true
@@ -56,8 +61,8 @@ permissions:
   pull-requests: write
 
 jobs:
-  promote:
-    name: Promote source → target
+  promote_selected:
+    name: Promote selected source → target
     runs-on: ubuntu-latest
 
     steps:
@@ -94,9 +99,8 @@ jobs:
           fi
 
           CURRENT=$(cat "$VERSION_FILE" | tr -d '[:space:]')
-          echo "Current target version: $CURRENT"
-
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
           if ! [[ "$MAJOR" =~ ^[0-9]+$ && "$MINOR" =~ ^[0-9]+$ && "$PATCH" =~ ^[0-9]+$ ]]; then
             echo "::error::Invalid version in $VERSION_FILE. Expected MAJOR.MINOR.PATCH"
             exit 1
@@ -112,7 +116,6 @@ jobs:
           esac
 
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "New target version: $NEW_VERSION"
 
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "new=$NEW_VERSION" >> "$GITHUB_OUTPUT"
@@ -120,17 +123,49 @@ jobs:
           echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
           echo "version_file=$VERSION_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Build promotion plan
+      - name: Build selective promotion plan
         id: plan
+        env:
+          INCLUDE_PATHS: ${{ github.event.inputs.include_paths }}
         run: |
           SOURCE_DIR="${{ steps.version.outputs.source_dir }}"
-          LIST_FILE="/tmp/full-promotion-list.txt"
+          LIST_FILE="/tmp/selective-promotion-list.txt"
+          : > "$LIST_FILE"
 
-          find "$SOURCE_DIR" -type f ! -name 'README.md' | sort > "$LIST_FILE"
+          while IFS= read -r raw_path; do
+            rel_path=$(echo "$raw_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            if [ -z "$rel_path" ]; then
+              continue
+            fi
+
+            src="$SOURCE_DIR/$rel_path"
+            src="${src%/}"
+
+            if [ ! -e "$src" ]; then
+              echo "::error::include_paths entry not found under source_dir: $rel_path"
+              exit 1
+            fi
+
+            if [ -f "$src" ]; then
+              if [ "$(basename "$src")" != "README.md" ]; then
+                echo "$src" >> "$LIST_FILE"
+              fi
+              continue
+            fi
+
+            while IFS= read -r file_src; do
+              if [ "$(basename "$file_src")" != "README.md" ]; then
+                echo "$file_src" >> "$LIST_FILE"
+              fi
+            done < <(find "$src" -type f)
+          done <<< "$INCLUDE_PATHS"
+
+          sort -u "$LIST_FILE" -o "$LIST_FILE"
           COPY_COUNT=$(wc -l < "$LIST_FILE" | tr -d ' ')
 
           if [ "$COPY_COUNT" -eq 0 ]; then
-            echo "::error::No source files found to promote."
+            echo "::error::No valid files found to promote from include_paths."
             exit 1
           fi
 
@@ -138,8 +173,10 @@ jobs:
           echo "list_file=$LIST_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Show plan summary
+        env:
+          INCLUDE_PATHS: ${{ github.event.inputs.include_paths }}
         run: |
-          echo "## Promotion Plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Selective Promotion Plan" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run mode: \`${{ github.event.inputs.run_mode }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Promote confirmation provided: \`${{ github.event.inputs.promote_confirmation != '' }}\`" >> "$GITHUB_STEP_SUMMARY"
@@ -150,6 +187,10 @@ jobs:
           echo "- Version: \`${{ steps.version.outputs.current }}\` -> \`${{ steps.version.outputs.new }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Files to copy: \`${{ steps.plan.outputs.copy_count }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### include_paths input" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          echo "$INCLUDE_PATHS" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "### First 50 files" >> "$GITHUB_STEP_SUMMARY"
           head -n 50 "${{ steps.plan.outputs.list_file }}" | sed 's/^/- `/' | sed 's/$/`/' >> "$GITHUB_STEP_SUMMARY"
 
@@ -193,11 +234,11 @@ jobs:
         run: |
           SRC_SAFE=$(echo "${{ steps.version.outputs.source_dir }}" | tr '/ ' '--')
           TGT_SAFE=$(echo "${{ steps.version.outputs.target_dir }}" | tr '/ ' '--')
-          BRANCH="promote/${SRC_SAFE}-to-${TGT_SAFE}-v${{ steps.version.outputs.new }}"
+          BRANCH="promote/selective-${SRC_SAFE}-to-${TGT_SAFE}-v${{ steps.version.outputs.new }}"
           git checkout -b "$BRANCH"
           echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      - name: Copy source files into target
+      - name: Copy selected files into target
         if: github.event.inputs.run_mode == 'promote'
         run: |
           SOURCE_DIR="${{ steps.version.outputs.source_dir }}"
@@ -207,7 +248,7 @@ jobs:
             dest="$TARGET_DIR/${src#${SOURCE_DIR}/}"
             mkdir -p "$(dirname "$dest")"
             cp "$src" "$dest"
-            echo "Copied: $src -> $dest"
+            echo "Copied file: $src -> $dest"
           done < "${{ steps.plan.outputs.list_file }}"
 
       - name: Update version file
@@ -229,21 +270,22 @@ jobs:
             exit 1
           fi
 
-          git commit -m "chore: promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})"
+          git commit -m "chore: selective promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})"
           git push origin "${{ steps.branch.outputs.name }}"
 
       - name: Open Pull Request
         if: github.event.inputs.run_mode == 'promote'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INCLUDE_PATHS: ${{ github.event.inputs.include_paths }}
         run: |
           gh pr create \
             --base "${{ github.event.inputs.target_branch }}" \
             --head "${{ steps.branch.outputs.name }}" \
-            --title "chore: promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})" \
-            --body "## Library Promotion
+            --title "chore: selective promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})" \
+            --body "## Selective Library Promotion
 
-          This PR was automatically generated by the **Promote Library Changes** workflow.
+          This PR was automatically generated by the **Promote Selected Library Changes** workflow.
 
           | Field | Value |
           |-------|-------|
@@ -253,6 +295,7 @@ jobs:
           | Source directory | \`${{ steps.version.outputs.source_dir }}\` |
           | Target directory | \`${{ steps.version.outputs.target_dir }}\` |
           | Version file | \`${{ steps.version.outputs.version_file }}\` |
+          | Include paths | \`${INCLUDE_PATHS//$'\n'/, }\` |
           | Previous target version | \`${{ steps.version.outputs.current }}\` |
           | New target version | \`${{ steps.version.outputs.new }}\` |
           | Version bump type | \`${{ github.event.inputs.version_bump }}\` |

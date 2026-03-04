@@ -1,9 +1,4 @@
-# Library Promotion Workflow
-#
-# Semi-automates moving approved changes from a source library
-# to a target library and bumps the target version.
-
-name: Promote Library Changes
+name: Promote Tagged Mod Changes
 
 on:
   workflow_dispatch:
@@ -22,17 +17,17 @@ on:
         default: ""
         type: string
       source_dir:
-        description: Source library directory to promote from (example: mod)
+        description: Source library directory (example: mod)
         required: true
         default: mod
         type: string
       target_dir:
-        description: Target library directory to promote into (example: base)
+        description: Target library directory (example: base)
         required: true
         default: base
         type: string
       version_file:
-        description: Version file path (example: base/VERSION)
+        description: Numeric version file (example: base/VERSION with 009 format)
         required: true
         default: base/VERSION
         type: string
@@ -41,23 +36,19 @@ on:
         required: true
         default: main
         type: string
-      version_bump:
-        description: Version bump type (patch/minor/major)
+      selected_mod:
+        description: Mod tag to promote (example: M02)
         required: true
-        default: patch
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+        default: M02
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
-  promote:
-    name: Promote source → target
+  promote_tagged:
+    name: Promote selected mod tag line-by-line
     runs-on: ubuntu-latest
 
     steps:
@@ -66,12 +57,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate inputs and bump version
+      - name: Validate inputs and compute next numeric version
         id: version
         run: |
           SOURCE_DIR="${{ github.event.inputs.source_dir }}"
           TARGET_DIR="${{ github.event.inputs.target_dir }}"
           VERSION_FILE="${{ github.event.inputs.version_file }}"
+          SELECTED_MOD="${{ github.event.inputs.selected_mod }}"
 
           if [ "$SOURCE_DIR" = "$TARGET_DIR" ]; then
             echo "::error::source_dir and target_dir must be different."
@@ -93,65 +85,61 @@ jobs:
             exit 1
           fi
 
-          CURRENT=$(cat "$VERSION_FILE" | tr -d '[:space:]')
-          echo "Current target version: $CURRENT"
-
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          if ! [[ "$MAJOR" =~ ^[0-9]+$ && "$MINOR" =~ ^[0-9]+$ && "$PATCH" =~ ^[0-9]+$ ]]; then
-            echo "::error::Invalid version in $VERSION_FILE. Expected MAJOR.MINOR.PATCH"
+          if ! echo "$SELECTED_MOD" | grep -Eq '^M[0-9]{2}$'; then
+            echo "::error::selected_mod must match MNN format, example M02"
             exit 1
           fi
 
-          case "${{ github.event.inputs.version_bump }}" in
-            major)
-              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor)
-              MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch)
-              PATCH=$((PATCH + 1)) ;;
-          esac
+          CURRENT=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+          if ! echo "$CURRENT" | grep -Eq '^[0-9]+$'; then
+            echo "::error::version_file must contain numeric version like 009"
+            exit 1
+          fi
 
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "New target version: $NEW_VERSION"
+          WIDTH=${#CURRENT}
+          NEW_NUM=$((10#$CURRENT + 1))
+          NEW=$(printf "%0${WIDTH}d" "$NEW_NUM")
 
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "new=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
           echo "source_dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
           echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
           echo "version_file=$VERSION_FILE" >> "$GITHUB_OUTPUT"
+          echo "selected_mod=$SELECTED_MOD" >> "$GITHUB_OUTPUT"
 
-      - name: Build promotion plan
-        id: plan
+      - name: Run tag-aware line-by-line processor
+        id: process
         run: |
-          SOURCE_DIR="${{ steps.version.outputs.source_dir }}"
-          LIST_FILE="/tmp/full-promotion-list.txt"
-
-          find "$SOURCE_DIR" -type f ! -name 'README.md' | sort > "$LIST_FILE"
-          COPY_COUNT=$(wc -l < "$LIST_FILE" | tr -d ' ')
-
-          if [ "$COPY_COUNT" -eq 0 ]; then
-            echo "::error::No source files found to promote."
-            exit 1
-          fi
-
-          echo "copy_count=$COPY_COUNT" >> "$GITHUB_OUTPUT"
-          echo "list_file=$LIST_FILE" >> "$GITHUB_OUTPUT"
+          python scripts/promote_tagged_mod.py \
+            --source-dir "${{ steps.version.outputs.source_dir }}" \
+            --target-dir "${{ steps.version.outputs.target_dir }}" \
+            --selected-mod "${{ steps.version.outputs.selected_mod }}" \
+            --new-version "${{ steps.version.outputs.new }}" \
+            --mode "${{ github.event.inputs.run_mode }}" \
+            --summary-file /tmp/tagged-summary.json
 
       - name: Show plan summary
         run: |
-          echo "## Promotion Plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Tagged Promotion Plan" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run mode: \`${{ github.event.inputs.run_mode }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Promote confirmation provided: \`${{ github.event.inputs.promote_confirmation != '' }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Allowlist configured: \`${{ vars.PROMOTION_ALLOWED_ACTORS != '' }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Source directory: \`${{ steps.version.outputs.source_dir }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Target directory: \`${{ steps.version.outputs.target_dir }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Version file: \`${{ steps.version.outputs.version_file }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Selected mod: \`${{ steps.version.outputs.selected_mod }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Version: \`${{ steps.version.outputs.current }}\` -> \`${{ steps.version.outputs.new }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Files to copy: \`${{ steps.plan.outputs.copy_count }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### First 50 files" >> "$GITHUB_STEP_SUMMARY"
-          head -n 50 "${{ steps.plan.outputs.list_file }}" | sed 's/^/- `/' | sed 's/$/`/' >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/tagged-summary.json').read_text(encoding='utf-8'))
+          summary = Path('${{ github.step_summary }}')
+          with summary.open('a', encoding='utf-8') as f:
+              f.write(f"- Files matched selected mod: `{data['files_count']}`\n")
+              f.write(f"- Tagged lines processed: `{data['tagged_lines_count']}`\n\n")
+              f.write('### Files\n')
+              for file in data['files'][:100]:
+                  f.write(f"- `{file}`\n")
+          PY
 
       - name: Validate promote confirmation
         if: github.event.inputs.run_mode == 'promote'
@@ -191,24 +179,10 @@ jobs:
         if: github.event.inputs.run_mode == 'promote'
         id: branch
         run: |
-          SRC_SAFE=$(echo "${{ steps.version.outputs.source_dir }}" | tr '/ ' '--')
-          TGT_SAFE=$(echo "${{ steps.version.outputs.target_dir }}" | tr '/ ' '--')
-          BRANCH="promote/${SRC_SAFE}-to-${TGT_SAFE}-v${{ steps.version.outputs.new }}"
+          MOD_SAFE=$(echo "${{ steps.version.outputs.selected_mod }}" | tr '/ ' '--')
+          BRANCH="promote/tag-${MOD_SAFE}-to-v${{ steps.version.outputs.new }}"
           git checkout -b "$BRANCH"
           echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
-
-      - name: Copy source files into target
-        if: github.event.inputs.run_mode == 'promote'
-        run: |
-          SOURCE_DIR="${{ steps.version.outputs.source_dir }}"
-          TARGET_DIR="${{ steps.version.outputs.target_dir }}"
-
-          while IFS= read -r src; do
-            dest="$TARGET_DIR/${src#${SOURCE_DIR}/}"
-            mkdir -p "$(dirname "$dest")"
-            cp "$src" "$dest"
-            echo "Copied: $src -> $dest"
-          done < "${{ steps.plan.outputs.list_file }}"
 
       - name: Update version file
         if: github.event.inputs.run_mode == 'promote'
@@ -229,7 +203,7 @@ jobs:
             exit 1
           fi
 
-          git commit -m "chore: promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})"
+          git commit -m "chore: promote ${{ steps.version.outputs.selected_mod }} as v${{ steps.version.outputs.new }} tag updates"
           git push origin "${{ steps.branch.outputs.name }}"
 
       - name: Open Pull Request
@@ -240,28 +214,28 @@ jobs:
           gh pr create \
             --base "${{ github.event.inputs.target_branch }}" \
             --head "${{ steps.branch.outputs.name }}" \
-            --title "chore: promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})" \
-            --body "## Library Promotion
+            --title "chore: promote ${{ steps.version.outputs.selected_mod }} as v${{ steps.version.outputs.new }}" \
+            --body "## Tagged Mod Promotion
 
-          This PR was automatically generated by the **Promote Library Changes** workflow.
+          This PR was automatically generated by the **Promote Tagged Mod Changes** workflow.
 
           | Field | Value |
           |-------|-------|
           | Run mode | \`${{ github.event.inputs.run_mode }}\` |
           | Promote confirmation | \`${{ github.event.inputs.promote_confirmation }}\` |
           | Allowlist variable | \`PROMOTION_ALLOWED_ACTORS\` |
+          | Selected mod | \`${{ steps.version.outputs.selected_mod }}\` |
           | Source directory | \`${{ steps.version.outputs.source_dir }}\` |
           | Target directory | \`${{ steps.version.outputs.target_dir }}\` |
           | Version file | \`${{ steps.version.outputs.version_file }}\` |
-          | Previous target version | \`${{ steps.version.outputs.current }}\` |
-          | New target version | \`${{ steps.version.outputs.new }}\` |
-          | Version bump type | \`${{ github.event.inputs.version_bump }}\` |
-          | PR base branch | \`${{ github.event.inputs.target_branch }}\` |
+          | Previous version | \`${{ steps.version.outputs.current }}\` |
+          | New version | \`${{ steps.version.outputs.new }}\` |
           | Triggered by | @${{ github.actor }} |
 
-          ### What to do next
-          1. Review changes in the **Files changed** tab.
-          2. Approve and merge if correct.
-          3. Target library is updated to version \`${{ steps.version.outputs.new }}\`.
+          ### What this workflow did
+          - Included only lines tagged with selected mod (example: M02-a / M02-d)
+          - Converted selected tag markers to new version markers (example: 010-a / 010-d)
+          - Excluded lines tagged with other mod IDs
+          - For selected `-d` lines, added comment marker prefix `* ` with updated tag
 
-          > Do not merge until review is complete."
+          > Review carefully before merge."
