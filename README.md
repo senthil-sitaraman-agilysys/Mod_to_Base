@@ -89,12 +89,20 @@ Use this when you want to promote only part of the source library.
 
 - `include_paths`: newline-separated file/folder paths relative to `source_dir`.
 
+You can enter any of these formats:
+
+- Regular path: `LEARN/EOO.RPGLE`
+- PF + member shorthand: `LEARN/EOO`
+- IBM i style shorthand: `LEARN(EOO)`
+
 3. Example `include_paths`:
 
 ```text
 programs/
 copybooks/customer.cpy
 sql/ddl/
+LEARN/EOO
+LEARN(FACT)
 ```
 
 4. First run with `run_mode=dry-run` and verify planned files in workflow **Summary**.

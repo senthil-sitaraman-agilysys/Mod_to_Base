@@ -22,17 +22,17 @@ on:
         default: ""
         type: string
       source_dir:
-        description: Source library directory (example: mod)
+        description: "Source library directory (example: mod)"
         required: true
         default: mod
         type: string
       target_dir:
-        description: Target library directory (example: base)
+        description: "Target library directory (example: base)"
         required: true
         default: base
         type: string
       version_file:
-        description: Version file path (example: base/VERSION)
+        description: "Version file path (example: base/VERSION)"
         required: true
         default: base/VERSION
         type: string
@@ -42,7 +42,7 @@ on:
         default: main
         type: string
       include_paths:
-        description: Newline-separated paths under source_dir to promote (files or folders)
+        description: "Newline-separated entries under source_dir to promote (path, PF/MBR, or PF(MBR))"
         required: true
         default: |
           programs/
@@ -137,6 +137,52 @@ jobs:
 
             if [ -z "$rel_path" ]; then
               continue
+            fi
+
+            # IBM i shorthand style: SRCFILE(MEMBER)
+            if [[ "$rel_path" =~ ^([A-Za-z0-9_#$@]+)\(([A-Za-z0-9_#$@]+)\)$ ]]; then
+              pf="${BASH_REMATCH[1]}"
+              mbr="${BASH_REMATCH[2]}"
+              pf_dir="$SOURCE_DIR/$pf"
+
+              if [ ! -d "$pf_dir" ]; then
+                echo "::error::Source PF folder not found for include_paths entry: $rel_path"
+                exit 1
+              fi
+
+              matches=$(find "$pf_dir" -maxdepth 1 -type f \( -iname "$mbr" -o -iname "$mbr.*" \))
+              if [ -z "$matches" ]; then
+                echo "::error::Source member not found for include_paths entry: $rel_path"
+                exit 1
+              fi
+
+              while IFS= read -r file_src; do
+                if [ -n "$file_src" ] && [ "$(basename "$file_src")" != "README.md" ]; then
+                  echo "$file_src" >> "$LIST_FILE"
+                fi
+              done <<< "$matches"
+
+              continue
+            fi
+
+            # IBM i shorthand style: SRCFILE/MEMBER (without extension)
+            if [[ "$rel_path" == */* ]]; then
+              pf="${rel_path%/*}"
+              mbr="${rel_path##*/}"
+              pf_dir="$SOURCE_DIR/$pf"
+
+              if [ -d "$pf_dir" ] && [[ "$mbr" != *.* ]]; then
+                matches=$(find "$pf_dir" -maxdepth 1 -type f \( -iname "$mbr" -o -iname "$mbr.*" \))
+                if [ -n "$matches" ]; then
+                  while IFS= read -r file_src; do
+                    if [ -n "$file_src" ] && [ "$(basename "$file_src")" != "README.md" ]; then
+                      echo "$file_src" >> "$LIST_FILE"
+                    fi
+                  done <<< "$matches"
+
+                  continue
+                fi
+              fi
             fi
 
             src="$SOURCE_DIR/$rel_path"
