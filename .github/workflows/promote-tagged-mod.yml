@@ -1,0 +1,241 @@
+name: Promote Tagged Mod Changes
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: Step mode (dry-run = preview only, promote = create PR)
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - promote
+      promote_confirmation:
+        description: Required only for promote mode. Type exactly CONFIRM-PROMOTE
+        required: false
+        default: ""
+        type: string
+      source_dir:
+        description: Source library directory (example: mod)
+        required: true
+        default: mod
+        type: string
+      target_dir:
+        description: Target library directory (example: base)
+        required: true
+        default: base
+        type: string
+      version_file:
+        description: Numeric version file (example: base/VERSION with 009 format)
+        required: true
+        default: base/VERSION
+        type: string
+      target_branch:
+        description: Branch to open the PR against
+        required: true
+        default: main
+        type: string
+      selected_mod:
+        description: Mod tag to promote (example: M02)
+        required: true
+        default: M02
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote_tagged:
+    name: Promote selected mod tag line-by-line
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate inputs and compute next numeric version
+        id: version
+        run: |
+          SOURCE_DIR="${{ github.event.inputs.source_dir }}"
+          TARGET_DIR="${{ github.event.inputs.target_dir }}"
+          VERSION_FILE="${{ github.event.inputs.version_file }}"
+          SELECTED_MOD="${{ github.event.inputs.selected_mod }}"
+
+          if [ "$SOURCE_DIR" = "$TARGET_DIR" ]; then
+            echo "::error::source_dir and target_dir must be different."
+            exit 1
+          fi
+
+          if [ ! -d "$SOURCE_DIR" ]; then
+            echo "::error::Source directory not found: $SOURCE_DIR"
+            exit 1
+          fi
+
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "::error::Target directory not found: $TARGET_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "::error::Version file not found: $VERSION_FILE"
+            exit 1
+          fi
+
+          if ! echo "$SELECTED_MOD" | grep -Eq '^M[0-9]{2}$'; then
+            echo "::error::selected_mod must match MNN format, example M02"
+            exit 1
+          fi
+
+          CURRENT=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+          if ! echo "$CURRENT" | grep -Eq '^[0-9]+$'; then
+            echo "::error::version_file must contain numeric version like 009"
+            exit 1
+          fi
+
+          WIDTH=${#CURRENT}
+          NEW_NUM=$((10#$CURRENT + 1))
+          NEW=$(printf "%0${WIDTH}d" "$NEW_NUM")
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "source_dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
+          echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
+          echo "version_file=$VERSION_FILE" >> "$GITHUB_OUTPUT"
+          echo "selected_mod=$SELECTED_MOD" >> "$GITHUB_OUTPUT"
+
+      - name: Run tag-aware line-by-line processor
+        id: process
+        run: |
+          python scripts/promote_tagged_mod.py \
+            --source-dir "${{ steps.version.outputs.source_dir }}" \
+            --target-dir "${{ steps.version.outputs.target_dir }}" \
+            --selected-mod "${{ steps.version.outputs.selected_mod }}" \
+            --new-version "${{ steps.version.outputs.new }}" \
+            --mode "${{ github.event.inputs.run_mode }}" \
+            --summary-file /tmp/tagged-summary.json
+
+      - name: Show plan summary
+        run: |
+          echo "## Tagged Promotion Plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run mode: \`${{ github.event.inputs.run_mode }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Promote confirmation provided: \`${{ github.event.inputs.promote_confirmation != '' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Allowlist configured: \`${{ vars.PROMOTION_ALLOWED_ACTORS != '' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Selected mod: \`${{ steps.version.outputs.selected_mod }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: \`${{ steps.version.outputs.current }}\` -> \`${{ steps.version.outputs.new }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('/tmp/tagged-summary.json').read_text(encoding='utf-8'))
+          summary = Path('${{ github.step_summary }}')
+          with summary.open('a', encoding='utf-8') as f:
+              f.write(f"- Files matched selected mod: `{data['files_count']}`\n")
+              f.write(f"- Tagged lines processed: `{data['tagged_lines_count']}`\n\n")
+              f.write('### Files\n')
+              for file in data['files'][:100]:
+                  f.write(f"- `{file}`\n")
+          PY
+
+      - name: Validate promote confirmation
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          if [ "${{ github.event.inputs.promote_confirmation }}" != "CONFIRM-PROMOTE" ]; then
+            echo "::error::For promote mode, set promote_confirmation exactly to CONFIRM-PROMOTE"
+            exit 1
+          fi
+
+      - name: Authorize actor for promote mode
+        if: github.event.inputs.run_mode == 'promote'
+        env:
+          ALLOWLIST: ${{ vars.PROMOTION_ALLOWED_ACTORS }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "$ALLOWLIST" ]; then
+            echo "::error::Repository variable PROMOTION_ALLOWED_ACTORS is not configured."
+            exit 1
+          fi
+
+          authorized=false
+          IFS=',' read -ra users <<< "$ALLOWLIST"
+          for user in "${users[@]}"; do
+            trimmed=$(echo "$user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ "$trimmed" = "$ACTOR" ]; then
+              authorized=true
+              break
+            fi
+          done
+
+          if [ "$authorized" != true ]; then
+            echo "::error::User '$ACTOR' is not allowed to run promote mode."
+            exit 1
+          fi
+
+      - name: Create promotion branch
+        if: github.event.inputs.run_mode == 'promote'
+        id: branch
+        run: |
+          MOD_SAFE=$(echo "${{ steps.version.outputs.selected_mod }}" | tr '/ ' '--')
+          BRANCH="promote/tag-${MOD_SAFE}-to-v${{ steps.version.outputs.new }}"
+          git checkout -b "$BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Update version file
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          echo "${{ steps.version.outputs.new }}" > "${{ steps.version.outputs.version_file }}"
+
+      - name: Commit and push changes
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ steps.version.outputs.target_dir }}/"
+          git add "${{ steps.version.outputs.version_file }}"
+
+          if git diff --cached --quiet; then
+            echo "::error::No changes detected to promote."
+            exit 1
+          fi
+
+          git commit -m "chore: promote ${{ steps.version.outputs.selected_mod }} as v${{ steps.version.outputs.new }} tag updates"
+          git push origin "${{ steps.branch.outputs.name }}"
+
+      - name: Open Pull Request
+        if: github.event.inputs.run_mode == 'promote'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base "${{ github.event.inputs.target_branch }}" \
+            --head "${{ steps.branch.outputs.name }}" \
+            --title "chore: promote ${{ steps.version.outputs.selected_mod }} as v${{ steps.version.outputs.new }}" \
+            --body "## Tagged Mod Promotion
+
+          This PR was automatically generated by the **Promote Tagged Mod Changes** workflow.
+
+          | Field | Value |
+          |-------|-------|
+          | Run mode | \`${{ github.event.inputs.run_mode }}\` |
+          | Promote confirmation | \`${{ github.event.inputs.promote_confirmation }}\` |
+          | Allowlist variable | \`PROMOTION_ALLOWED_ACTORS\` |
+          | Selected mod | \`${{ steps.version.outputs.selected_mod }}\` |
+          | Source directory | \`${{ steps.version.outputs.source_dir }}\` |
+          | Target directory | \`${{ steps.version.outputs.target_dir }}\` |
+          | Version file | \`${{ steps.version.outputs.version_file }}\` |
+          | Previous version | \`${{ steps.version.outputs.current }}\` |
+          | New version | \`${{ steps.version.outputs.new }}\` |
+          | Triggered by | @${{ github.actor }} |
+
+          ### What this workflow did
+          - Included only lines tagged with selected mod (example: M02-a / M02-d)
+          - Converted selected tag markers to new version markers (example: 010-a / 010-d)
+          - Excluded lines tagged with other mod IDs
+          - For selected `-d` lines, added comment marker prefix `* ` with updated tag
+
+          > Review carefully before merge."

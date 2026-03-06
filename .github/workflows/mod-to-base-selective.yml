@@ -1,0 +1,356 @@
+# Selective Library Promotion Workflow
+#
+# Promotes only selected files/folders from source library to target library,
+# then bumps target version and opens a PR.
+
+name: Promote Selected Library Changes
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: Step mode (dry-run = preview only, promote = create PR)
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - promote
+      promote_confirmation:
+        description: Required only for promote mode. Type exactly CONFIRM-PROMOTE
+        required: false
+        default: ""
+        type: string
+      source_dir:
+        description: "Source library directory (example: mod)"
+        required: true
+        default: mod
+        type: string
+      target_dir:
+        description: "Target library directory (example: base)"
+        required: true
+        default: base
+        type: string
+      version_file:
+        description: "Version file path (example: base/VERSION)"
+        required: true
+        default: base/VERSION
+        type: string
+      target_branch:
+        description: Branch to open the PR against
+        required: true
+        default: main
+        type: string
+      include_paths:
+        description: "Newline-separated entries under source_dir to promote (path, PF/MBR, or PF(MBR))"
+        required: true
+        default: |
+          programs/
+      version_bump:
+        description: Version bump type (patch/minor/major)
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote_selected:
+    name: Promote selected source → target
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate inputs and bump version
+        id: version
+        run: |
+          SOURCE_DIR="${{ github.event.inputs.source_dir }}"
+          TARGET_DIR="${{ github.event.inputs.target_dir }}"
+          VERSION_FILE="${{ github.event.inputs.version_file }}"
+
+          if [ "$SOURCE_DIR" = "$TARGET_DIR" ]; then
+            echo "::error::source_dir and target_dir must be different."
+            exit 1
+          fi
+
+          if [ ! -d "$SOURCE_DIR" ]; then
+            echo "::error::Source directory not found: $SOURCE_DIR"
+            exit 1
+          fi
+
+          if [ ! -d "$TARGET_DIR" ]; then
+            echo "::error::Target directory not found: $TARGET_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "::error::Version file not found: $VERSION_FILE"
+            exit 1
+          fi
+
+          CURRENT=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          if ! [[ "$MAJOR" =~ ^[0-9]+$ && "$MINOR" =~ ^[0-9]+$ && "$PATCH" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid version in $VERSION_FILE. Expected MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          case "${{ github.event.inputs.version_bump }}" in
+            major)
+              MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor)
+              MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch)
+              PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
+          echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
+          echo "version_file=$VERSION_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Build selective promotion plan
+        id: plan
+        env:
+          INCLUDE_PATHS: ${{ github.event.inputs.include_paths }}
+        run: |
+          SOURCE_DIR="${{ steps.version.outputs.source_dir }}"
+          LIST_FILE="/tmp/selective-promotion-list.txt"
+          : > "$LIST_FILE"
+
+          while IFS= read -r raw_path; do
+            rel_path=$(echo "$raw_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            if [ -z "$rel_path" ]; then
+              continue
+            fi
+
+            # IBM i shorthand style: SRCFILE(MEMBER)
+            if [[ "$rel_path" =~ ^([A-Za-z0-9_#$@]+)\(([A-Za-z0-9_#$@]+)\)$ ]]; then
+              pf="${BASH_REMATCH[1]}"
+              mbr="${BASH_REMATCH[2]}"
+              pf_dir="$SOURCE_DIR/$pf"
+
+              if [ ! -d "$pf_dir" ]; then
+                echo "::error::Source PF folder not found for include_paths entry: $rel_path"
+                exit 1
+              fi
+
+              matches=$(find "$pf_dir" -maxdepth 1 -type f \( -iname "$mbr" -o -iname "$mbr.*" \))
+              if [ -z "$matches" ]; then
+                echo "::error::Source member not found for include_paths entry: $rel_path"
+                exit 1
+              fi
+
+              while IFS= read -r file_src; do
+                if [ -n "$file_src" ] && [ "$(basename "$file_src")" != "README.md" ]; then
+                  echo "$file_src" >> "$LIST_FILE"
+                fi
+              done <<< "$matches"
+
+              continue
+            fi
+
+            # IBM i shorthand style: SRCFILE/MEMBER (without extension)
+            if [[ "$rel_path" == */* ]]; then
+              pf="${rel_path%/*}"
+              mbr="${rel_path##*/}"
+              pf_dir="$SOURCE_DIR/$pf"
+
+              if [ -d "$pf_dir" ] && [[ "$mbr" != *.* ]]; then
+                matches=$(find "$pf_dir" -maxdepth 1 -type f \( -iname "$mbr" -o -iname "$mbr.*" \))
+                if [ -n "$matches" ]; then
+                  while IFS= read -r file_src; do
+                    if [ -n "$file_src" ] && [ "$(basename "$file_src")" != "README.md" ]; then
+                      echo "$file_src" >> "$LIST_FILE"
+                    fi
+                  done <<< "$matches"
+
+                  continue
+                fi
+              fi
+            fi
+
+            src="$SOURCE_DIR/$rel_path"
+            src="${src%/}"
+
+            if [ ! -e "$src" ]; then
+              echo "::error::include_paths entry not found under source_dir: $rel_path"
+              exit 1
+            fi
+
+            if [ -f "$src" ]; then
+              if [ "$(basename "$src")" != "README.md" ]; then
+                echo "$src" >> "$LIST_FILE"
+              fi
+              continue
+            fi
+
+            while IFS= read -r file_src; do
+              if [ "$(basename "$file_src")" != "README.md" ]; then
+                echo "$file_src" >> "$LIST_FILE"
+              fi
+            done < <(find "$src" -type f)
+          done <<< "$INCLUDE_PATHS"
+
+          sort -u "$LIST_FILE" -o "$LIST_FILE"
+          COPY_COUNT=$(wc -l < "$LIST_FILE" | tr -d ' ')
+
+          if [ "$COPY_COUNT" -eq 0 ]; then
+            echo "::error::No valid files found to promote from include_paths."
+            exit 1
+          fi
+
+          echo "copy_count=$COPY_COUNT" >> "$GITHUB_OUTPUT"
+          echo "list_file=$LIST_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Show plan summary
+        env:
+          INCLUDE_PATHS: ${{ github.event.inputs.include_paths }}
+        run: |
+          echo "## Selective Promotion Plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run mode: \`${{ github.event.inputs.run_mode }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Promote confirmation provided: \`${{ github.event.inputs.promote_confirmation != '' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Allowlist configured: \`${{ vars.PROMOTION_ALLOWED_ACTORS != '' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source directory: \`${{ steps.version.outputs.source_dir }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Target directory: \`${{ steps.version.outputs.target_dir }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version file: \`${{ steps.version.outputs.version_file }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: \`${{ steps.version.outputs.current }}\` -> \`${{ steps.version.outputs.new }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Files to copy: \`${{ steps.plan.outputs.copy_count }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### include_paths input" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          echo "$INCLUDE_PATHS" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "### First 50 files" >> "$GITHUB_STEP_SUMMARY"
+          head -n 50 "${{ steps.plan.outputs.list_file }}" | sed 's/^/- `/' | sed 's/$/`/' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate promote confirmation
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          if [ "${{ github.event.inputs.promote_confirmation }}" != "CONFIRM-PROMOTE" ]; then
+            echo "::error::For promote mode, set promote_confirmation exactly to CONFIRM-PROMOTE"
+            exit 1
+          fi
+
+      - name: Authorize actor for promote mode
+        if: github.event.inputs.run_mode == 'promote'
+        env:
+          ALLOWLIST: ${{ vars.PROMOTION_ALLOWED_ACTORS }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "$ALLOWLIST" ]; then
+            echo "::error::Repository variable PROMOTION_ALLOWED_ACTORS is not configured."
+            exit 1
+          fi
+
+          authorized=false
+          IFS=',' read -ra users <<< "$ALLOWLIST"
+          for user in "${users[@]}"; do
+            trimmed=$(echo "$user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ "$trimmed" = "$ACTOR" ]; then
+              authorized=true
+              break
+            fi
+          done
+
+          if [ "$authorized" != true ]; then
+            echo "::error::User '$ACTOR' is not allowed to run promote mode."
+            exit 1
+          fi
+
+      - name: Create promotion branch
+        if: github.event.inputs.run_mode == 'promote'
+        id: branch
+        run: |
+          SRC_SAFE=$(echo "${{ steps.version.outputs.source_dir }}" | tr '/ ' '--')
+          TGT_SAFE=$(echo "${{ steps.version.outputs.target_dir }}" | tr '/ ' '--')
+          BRANCH="promote/selective-${SRC_SAFE}-to-${TGT_SAFE}-v${{ steps.version.outputs.new }}"
+          git checkout -b "$BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Copy selected files into target
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          SOURCE_DIR="${{ steps.version.outputs.source_dir }}"
+          TARGET_DIR="${{ steps.version.outputs.target_dir }}"
+
+          while IFS= read -r src; do
+            dest="$TARGET_DIR/${src#${SOURCE_DIR}/}"
+            mkdir -p "$(dirname "$dest")"
+            cp "$src" "$dest"
+            echo "Copied file: $src -> $dest"
+          done < "${{ steps.plan.outputs.list_file }}"
+
+      - name: Update version file
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          echo "${{ steps.version.outputs.new }}" > "${{ steps.version.outputs.version_file }}"
+
+      - name: Commit and push changes
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ steps.version.outputs.target_dir }}/"
+          git add "${{ steps.version.outputs.version_file }}"
+
+          if git diff --cached --quiet; then
+            echo "::error::No changes detected to promote."
+            exit 1
+          fi
+
+          git commit -m "chore: selective promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})"
+          git push origin "${{ steps.branch.outputs.name }}"
+
+      - name: Open Pull Request
+        if: github.event.inputs.run_mode == 'promote'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INCLUDE_PATHS: ${{ github.event.inputs.include_paths }}
+        run: |
+          gh pr create \
+            --base "${{ github.event.inputs.target_branch }}" \
+            --head "${{ steps.branch.outputs.name }}" \
+            --title "chore: selective promote ${{ steps.version.outputs.source_dir }} -> ${{ steps.version.outputs.target_dir }} (v${{ steps.version.outputs.new }})" \
+            --body "## Selective Library Promotion
+
+          This PR was automatically generated by the **Promote Selected Library Changes** workflow.
+
+          | Field | Value |
+          |-------|-------|
+          | Run mode | \`${{ github.event.inputs.run_mode }}\` |
+          | Promote confirmation | \`${{ github.event.inputs.promote_confirmation }}\` |
+          | Allowlist variable | \`PROMOTION_ALLOWED_ACTORS\` |
+          | Source directory | \`${{ steps.version.outputs.source_dir }}\` |
+          | Target directory | \`${{ steps.version.outputs.target_dir }}\` |
+          | Version file | \`${{ steps.version.outputs.version_file }}\` |
+          | Include paths | \`${INCLUDE_PATHS//$'\n'/, }\` |
+          | Previous target version | \`${{ steps.version.outputs.current }}\` |
+          | New target version | \`${{ steps.version.outputs.new }}\` |
+          | Version bump type | \`${{ github.event.inputs.version_bump }}\` |
+          | PR base branch | \`${{ github.event.inputs.target_branch }}\` |
+          | Triggered by | @${{ github.actor }} |
+
+          ### What to do next
+          1. Review changes in the **Files changed** tab.
+          2. Approve and merge if correct.
+          3. Target library is updated to version \`${{ steps.version.outputs.new }}\`.
+
+          > Do not merge until review is complete."
