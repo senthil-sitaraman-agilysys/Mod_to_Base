@@ -21,6 +21,14 @@ on:
         required: true
         default: main
         type: string
+      runner_type:
+        description: Runner to use (self-hosted required for private IBM i IPs like 10.x/192.168.x)
+        required: true
+        default: github-hosted
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted
       ibmi_host:
         description: IBM i host name or IP
         required: true
@@ -59,13 +67,25 @@ permissions:
 jobs:
   sync_from_ibmi:
     name: Sync members from IBM i
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.inputs.runner_type == 'self-hosted' && 'self-hosted' || 'ubuntu-latest' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate runner reachability mode
+        env:
+          RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
+          IBMI_HOST: ${{ github.event.inputs.ibmi_host }}
+        run: |
+          if [ "$RUNNER_TYPE" = "github-hosted" ]; then
+            if echo "$IBMI_HOST" | grep -Eq '^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.'; then
+              echo "::error::IBM i host '$IBMI_HOST' appears to be a private IP. GitHub-hosted runners cannot reach private internal networks. Re-run with runner_type=self-hosted (runner inside your network)."
+              exit 1
+            fi
+          fi
 
       - name: Validate promote confirmation
         if: github.event.inputs.run_mode == 'promote'
@@ -182,6 +202,7 @@ jobs:
           echo "## IBM i Sync Plan" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run mode: \`${{ github.event.inputs.run_mode }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runner type: \`${{ github.event.inputs.runner_type }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- IBM i host: \`${{ github.event.inputs.ibmi_host }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source library: \`${{ github.event.inputs.source_library }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source file: \`${{ github.event.inputs.source_srcfile }}\`" >> "$GITHUB_STEP_SUMMARY"
