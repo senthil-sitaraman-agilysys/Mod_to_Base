@@ -79,7 +79,13 @@ jobs:
         env:
           RUNNER_TYPE: ${{ github.event.inputs.runner_type }}
           IBMI_HOST: ${{ github.event.inputs.ibmi_host }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
+          if [ "$RUNNER_TYPE" = "self-hosted" ] && [ "$RUNNER_ENVIRONMENT" != "self-hosted" ]; then
+            echo "::error::runner_type is self-hosted but this job is running on '$RUNNER_ENVIRONMENT'. Ensure a self-hosted runner is online and available."
+            exit 1
+          fi
+
           if [ "$RUNNER_TYPE" = "github-hosted" ]; then
             if echo "$IBMI_HOST" | grep -Eq '^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.'; then
               echo "::error::IBM i host '$IBMI_HOST' appears to be a private IP. GitHub-hosted runners cannot reach private internal networks. Re-run with runner_type=self-hosted (runner inside your network)."
@@ -146,6 +152,32 @@ jobs:
 
           chmod 600 ~/.ssh/known_hosts
 
+      - name: SSH connectivity preflight
+        env:
+          IBMI_HOST: ${{ github.event.inputs.ibmi_host }}
+          IBMI_USER: ${{ github.event.inputs.ibmi_user }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_NAME: ${{ runner.name }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          echo "Runner environment: $RUNNER_ENVIRONMENT"
+          echo "Runner name: $RUNNER_NAME"
+          echo "Runner OS: $RUNNER_OS"
+
+          if ! timeout 10 bash -c "</dev/tcp/$IBMI_HOST/22"; then
+            echo "::error::Cannot reach $IBMI_HOST:22 from this runner. Use a self-hosted runner inside the IBM i network/VPN."
+            exit 1
+          fi
+
+          if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$IBMI_USER@$IBMI_HOST" "echo SSH_OK" >/tmp/ssh_preflight.out 2>/tmp/ssh_preflight.err; then
+            echo "::error::SSH preflight failed. Check authorized_keys, IBM i SSH service, and secrets."
+            echo "--- ssh stderr ---"
+            cat /tmp/ssh_preflight.err
+            exit 1
+          fi
+
+          cat /tmp/ssh_preflight.out
+
       - name: Export source members from IBM i
         id: export
         env:
@@ -203,6 +235,8 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- Run mode: \`${{ github.event.inputs.run_mode }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Runner type: \`${{ github.event.inputs.runner_type }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runner environment: \`${{ runner.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runner name: \`${{ runner.name }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- IBM i host: \`${{ github.event.inputs.ibmi_host }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source library: \`${{ github.event.inputs.source_library }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source file: \`${{ github.event.inputs.source_srcfile }}\`" >> "$GITHUB_STEP_SUMMARY"
