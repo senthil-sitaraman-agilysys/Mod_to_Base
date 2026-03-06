@@ -1,0 +1,244 @@
+name: IBM i Connected Member Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: Step mode (dry-run = preview only, promote = commit + PR)
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - promote
+      promote_confirmation:
+        description: Required only for promote mode. Type exactly CONFIRM-PROMOTE
+        required: false
+        default: ""
+        type: string
+      target_branch:
+        description: Branch to open the PR against
+        required: true
+        default: main
+        type: string
+      ibmi_host:
+        description: IBM i host name or IP
+        required: true
+        type: string
+      ibmi_user:
+        description: IBM i user for SSH connection
+        required: true
+        type: string
+      source_library:
+        description: "IBM i source library (example: LMMOD743GR)"
+        required: true
+        type: string
+      source_srcfile:
+        description: "IBM i source PF (example: QRPGLESRC)"
+        required: true
+        type: string
+      member_list:
+        description: Newline-separated member names (example INJRESUPDG, one per line)
+        required: true
+        type: string
+      repo_target_dir:
+        description: "Repo path to place exported members (example: mod/qrpglesrc/lmmod743gr)"
+        required: true
+        default: mod
+        type: string
+      member_extension:
+        description: "Extension to append to exported member files (example: .RPGLE or blank)"
+        required: false
+        default: .RPGLE
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync_from_ibmi:
+    name: Sync members from IBM i
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate promote confirmation
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          if [ "${{ github.event.inputs.promote_confirmation }}" != "CONFIRM-PROMOTE" ]; then
+            echo "::error::For promote mode, set promote_confirmation exactly to CONFIRM-PROMOTE"
+            exit 1
+          fi
+
+      - name: Authorize actor for promote mode
+        if: github.event.inputs.run_mode == 'promote'
+        env:
+          ALLOWLIST: ${{ vars.PROMOTION_ALLOWED_ACTORS }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "$ALLOWLIST" ]; then
+            echo "::error::Repository variable PROMOTION_ALLOWED_ACTORS is not configured."
+            exit 1
+          fi
+
+          authorized=false
+          IFS=',' read -ra users <<< "$ALLOWLIST"
+          for user in "${users[@]}"; do
+            trimmed=$(echo "$user" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ "$trimmed" = "$ACTOR" ]; then
+              authorized=true
+              break
+            fi
+          done
+
+          if [ "$authorized" != true ]; then
+            echo "::error::User '$ACTOR' is not allowed to run promote mode."
+            exit 1
+          fi
+
+      - name: Configure SSH for IBM i connection
+        env:
+          IBMI_HOST: ${{ github.event.inputs.ibmi_host }}
+          IBMI_SSH_PRIVATE_KEY: ${{ secrets.IBMI_SSH_PRIVATE_KEY }}
+          IBMI_KNOWN_HOSTS: ${{ secrets.IBMI_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$IBMI_SSH_PRIVATE_KEY" ]; then
+            echo "::error::Secret IBMI_SSH_PRIVATE_KEY is required."
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$IBMI_SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+          if [ -n "$IBMI_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$IBMI_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$IBMI_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Export source members from IBM i
+        id: export
+        env:
+          IBMI_HOST: ${{ github.event.inputs.ibmi_host }}
+          IBMI_USER: ${{ github.event.inputs.ibmi_user }}
+          SOURCE_LIBRARY: ${{ github.event.inputs.source_library }}
+          SOURCE_SRCFILE: ${{ github.event.inputs.source_srcfile }}
+          MEMBER_LIST: ${{ github.event.inputs.member_list }}
+          REPO_TARGET_DIR: ${{ github.event.inputs.repo_target_dir }}
+          MEMBER_EXTENSION: ${{ github.event.inputs.member_extension }}
+        run: |
+          SOURCE_LIBRARY_UPPER=$(echo "$SOURCE_LIBRARY" | tr '[:lower:]' '[:upper:]')
+          SOURCE_SRCFILE_UPPER=$(echo "$SOURCE_SRCFILE" | tr '[:lower:]' '[:upper:]')
+
+          mkdir -p "$REPO_TARGET_DIR"
+
+          REMOTE_TMP="/tmp/ibmi_member_export_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          LIST_FILE="/tmp/exported-members.txt"
+          : > "$LIST_FILE"
+
+          member_count=0
+
+          while IFS= read -r raw_member; do
+            member_trimmed=$(echo "$raw_member" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -z "$member_trimmed" ]; then
+              continue
+            fi
+
+            member_base="${member_trimmed%%.*}"
+            member_upper=$(echo "$member_base" | tr '[:lower:]' '[:upper:]')
+
+            ssh "$IBMI_USER@$IBMI_HOST" "mkdir -p '$REMOTE_TMP'"
+            ssh "$IBMI_USER@$IBMI_HOST" "system \"CPYTOSTMF FROMMBR('/QSYS.LIB/${SOURCE_LIBRARY_UPPER}.LIB/${SOURCE_SRCFILE_UPPER}.FILE/${member_upper}.MBR') TOSTMF('${REMOTE_TMP}/${member_upper}') STMFOPT(*REPLACE) ENDLINFMT(*LF)\""
+
+            local_file_name="${member_upper}${MEMBER_EXTENSION}"
+            scp "$IBMI_USER@$IBMI_HOST:${REMOTE_TMP}/${member_upper}" "$REPO_TARGET_DIR/$local_file_name"
+
+            echo "$REPO_TARGET_DIR/$local_file_name" >> "$LIST_FILE"
+            member_count=$((member_count + 1))
+          done <<< "$MEMBER_LIST"
+
+          ssh "$IBMI_USER@$IBMI_HOST" "rm -rf '$REMOTE_TMP'"
+
+          if [ "$member_count" -eq 0 ]; then
+            echo "::error::No valid members provided in member_list."
+            exit 1
+          fi
+
+          echo "member_count=$member_count" >> "$GITHUB_OUTPUT"
+          echo "list_file=$LIST_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Show sync summary
+        run: |
+          echo "## IBM i Sync Plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run mode: \`${{ github.event.inputs.run_mode }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- IBM i host: \`${{ github.event.inputs.ibmi_host }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source library: \`${{ github.event.inputs.source_library }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source file: \`${{ github.event.inputs.source_srcfile }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Repo target dir: \`${{ github.event.inputs.repo_target_dir }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Exported members: \`${{ steps.export.outputs.member_count }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Exported files" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r file; do
+            echo "- \`$file\`" >> "$GITHUB_STEP_SUMMARY"
+          done < "${{ steps.export.outputs.list_file }}"
+
+      - name: Create sync branch
+        if: github.event.inputs.run_mode == 'promote'
+        id: branch
+        run: |
+          SRC_SAFE=$(echo "${{ github.event.inputs.source_srcfile }}" | tr '[:upper:]' '[:lower:]')
+          LIB_SAFE=$(echo "${{ github.event.inputs.source_library }}" | tr '[:upper:]' '[:lower:]')
+          BRANCH="sync/ibmi-${SRC_SAFE}-${LIB_SAFE}-${GITHUB_RUN_ID}"
+          git checkout -b "$BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push synced files
+        if: github.event.inputs.run_mode == 'promote'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ github.event.inputs.repo_target_dir }}/"
+
+          if git diff --cached --quiet; then
+            echo "::error::No sync changes detected to commit."
+            exit 1
+          fi
+
+          git commit -m "chore: sync IBM i members from ${{ github.event.inputs.source_library }}/${{ github.event.inputs.source_srcfile }}"
+          git push origin "${{ steps.branch.outputs.name }}"
+
+      - name: Open Pull Request
+        if: github.event.inputs.run_mode == 'promote'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base "${{ github.event.inputs.target_branch }}" \
+            --head "${{ steps.branch.outputs.name }}" \
+            --title "chore: sync IBM i members from ${{ github.event.inputs.source_library }}/${{ github.event.inputs.source_srcfile }}" \
+            --body "## IBM i Connected Sync
+
+          This PR was generated by **IBM i Connected Member Sync** workflow.
+
+          | Field | Value |
+          |-------|-------|
+          | Run mode | \`${{ github.event.inputs.run_mode }}\` |
+          | Source library | \`${{ github.event.inputs.source_library }}\` |
+          | Source file | \`${{ github.event.inputs.source_srcfile }}\` |
+          | Member count | \`${{ steps.export.outputs.member_count }}\` |
+          | Repo target dir | \`${{ github.event.inputs.repo_target_dir }}\` |
+          | Triggered by | @${{ github.actor }} |
+
+          > Review synced member content before merge."
